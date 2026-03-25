@@ -4,6 +4,17 @@ All notable changes to CausalLens will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.0] — 2025-07-24
+
+### Added
+- Difference-in-differences estimator (`DifferenceInDifferences`) with regression-based ATT, cluster-robust standard errors via statsmodels, and parallel-trends pre-test with joint F-test.
+- Synthetic control method (`SyntheticControl`) with constrained least-squares donor weights (scipy SLSQP) and placebo inference via leave-one-out control-unit permutation.
+- Two-stage least squares estimator (`TwoStageLeastSquares`) with proper IV variance formula, first-stage F-statistic, and weak-instrument detection (F < 10).
+- Monte Carlo simulation framework (`run_simulation`, `summarize_simulation`, `run_quick_simulation`) with five data-generating processes (linear, nonlinear_outcome, nonlinear_propensity, double_nonlinear, strong_confounding) evaluating bias, RMSE, coverage, MAE, and SE calibration ratio across all estimators.
+- IPW propensity-score estimation uncertainty correction using Lunceford & Davidian (2004) stacked estimating equations, enabled by default via `account_for_propensity_estimation` flag.
+- Result dataclasses: `DiDEstimate`, `SyntheticControlEstimate`, `IVEstimate`.
+- 20 new tests covering panel estimators, IV, simulation, and IPW propensity correction.
+
 ## [0.2.0] — 2026-03-24
 
 ### Added

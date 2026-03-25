@@ -339,6 +339,7 @@ class PropensityMatcher(BaseEstimator):
 
 class IPWEstimator(BaseEstimator):
     weight_cap: float = 20.0
+    account_for_propensity_estimation: bool = True
 
     def _ipw_weights(self, treatment: np.ndarray, propensity: np.ndarray) -> np.ndarray:
         p_treat = treatment.mean()
@@ -353,34 +354,97 @@ class IPWEstimator(BaseEstimator):
         return np.clip(raw, 0.0, self.weight_cap)
 
     def _estimate_effect(self, frame: pd.DataFrame) -> float:
-        propensity = self._fit_propensity(frame)
+        scaler = StandardScaler()
+        x_matrix = scaler.fit_transform(frame[self.confounders])
+        y_vector = frame[self.treatment_col]
+        ps_model = LogisticRegression(max_iter=5_000)
+        ps_model.fit(x_matrix, y_vector)
+        propensity = np.clip(ps_model.predict_proba(x_matrix)[:, 1], 1e-2, 1.0 - 1e-2)
+
         treatment = frame[self.treatment_col].to_numpy(dtype=int)
         outcome = frame[self.outcome_col].to_numpy(dtype=float)
         weights = self._ipw_weights(treatment, propensity)
         treated_mean = np.average(outcome[treatment == 1], weights=weights[treatment == 1])
         control_mean = np.average(outcome[treatment == 0], weights=weights[treatment == 0])
         effect = float(treated_mean - control_mean)
-        # Hajek influence-function SE (sandwich variance)
-        # Influence values are normalized by sum(w), not mean(w), so the
-        # correct sandwich variance is n * Var(phi) rather than Var(phi)/n.
+
         n = len(outcome)
         sum_w1 = weights[treatment == 1].sum()
         sum_w0 = weights[treatment == 0].sum()
+
+        # Base Hajek influence function
         influence = np.where(
             treatment == 1,
             weights * (outcome - treated_mean) / sum_w1,
             -weights * (outcome - control_mean) / sum_w0,
         )
-        if n > 1:
-            self._last_se = float(np.sqrt(np.var(influence, ddof=1) * n))
-            if self._last_se > 1e-12:
-                z = effect / self._last_se
-                self._last_p_value = float(2.0 * (1.0 - norm.cdf(abs(z))))
+
+        if n > 1 and self.account_for_propensity_estimation:
+            # Lunceford & Davidian (2004) correction for estimated propensity scores.
+            # The stacked estimating equations yield an augmented influence function
+            # that adds the projection of the IPW score onto the propensity score
+            # equation, which generally *reduces* the variance (Hirano, Imbens &
+            # Ridder 2003 showed the semiparametric efficiency gain).
+            #
+            # Correction term: H @ V_gamma_inv @ S_gamma
+            # where S_gamma is the propensity score function for each observation,
+            # H is the Jacobian d(IPW_influence)/d(gamma), and V_gamma is the
+            # Fisher information of the propensity model.
+
+            # Score of logistic propensity model: S_i = (t_i - e_i) * x_i
+            e = propensity
+            score_matrix = (treatment - e).reshape(-1, 1) * x_matrix  # (n, p)
+
+            # Hessian / Fisher info of logistic model: V = X' diag(e*(1-e)) X / n
+            w_diag = e * (1.0 - e)  # (n,)
+            fisher = (x_matrix * w_diag.reshape(-1, 1)).T @ x_matrix / n  # (p, p)
+            try:
+                fisher_inv = np.linalg.inv(fisher)
+            except np.linalg.LinAlgError:
+                fisher_inv = np.linalg.pinv(fisher)
+
+            # Jacobian: how changing gamma shifts the IPW influence
+            # For Hajek IPW: d(phi_i)/d(gamma) involves de/dgamma = e(1-e)*x
+            de_dgamma = (e * (1.0 - e)).reshape(-1, 1) * x_matrix  # (n, p)
+
+            p_treat = treatment.mean()
+            # Derivative of weights w.r.t. propensity
+            if self.estimand.upper() == "ATT":
+                dw_de = np.where(treatment == 1, 0.0, 1.0 / (1.0 - e)**2)
             else:
-                self._last_p_value = None
+                dw_de = np.where(treatment == 1, -p_treat / e**2, (1.0 - p_treat) / (1.0 - e)**2)
+            dw_de = np.clip(dw_de, -self.weight_cap, self.weight_cap)
+
+            # H_i = d(phi_i)/d(gamma) = dw_de_i * residual_i / sum_w * de_dgamma_i
+            residual_part = np.where(
+                treatment == 1,
+                (outcome - treated_mean) / sum_w1,
+                -(outcome - control_mean) / sum_w0,
+            )
+            h_matrix = (dw_de * residual_part).reshape(-1, 1) * de_dgamma  # (n, p)
+
+            # Mean of H across observations
+            h_mean = h_matrix.mean(axis=0)  # (p,)
+
+            # Correction to influence: subtract H_mean @ fisher_inv @ score_i
+            correction = score_matrix @ fisher_inv @ h_mean  # (n,)
+            influence_adjusted = influence - correction
+
+            self._last_se = float(np.sqrt(np.var(influence_adjusted, ddof=1) * n))
+        elif n > 1:
+            # Hajek SE without propensity correction
+            self._last_se = float(np.sqrt(np.var(influence, ddof=1) * n))
         else:
             self._last_se = None
             self._last_p_value = None
+            return effect
+
+        if self._last_se is not None and self._last_se > 1e-12:
+            z = effect / self._last_se
+            self._last_p_value = float(2.0 * (1.0 - norm.cdf(abs(z))))
+        else:
+            self._last_p_value = None
+
         return effect
 
     def _diagnostic_weights(self, frame: pd.DataFrame, propensity: np.ndarray) -> np.ndarray | None:

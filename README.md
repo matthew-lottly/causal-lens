@@ -7,18 +7,19 @@ Data science portfolio project for causal effect estimation, observational-study
 - Lane: Data science and causal inference
 - Domain: Observational treatment-effect estimation
 - Stack: Python, pandas, scikit-learn, statsmodels, lightweight estimator objects
-- Includes: regression adjustment, propensity scoring, matching, inverse probability weighting, doubly robust estimation, diagnostics, subgroup summaries, sensitivity analysis, tests
-- Includes: a fixed observational intervention dataset, two public benchmark datasets, synthetic known-effect validation, and publication-oriented methodology notes
+- Includes: regression adjustment, propensity scoring, matching, inverse probability weighting, doubly robust estimation, difference-in-differences, synthetic control, instrumental variables / 2SLS, diagnostics, subgroup summaries, sensitivity analysis, Monte Carlo simulation study, tests
+- Includes: a fixed observational intervention dataset, two public benchmark datasets, synthetic known-effect validation, formal simulation study, and publication-oriented methodology notes
 
 ## Overview
 
 CausalLens packages core causal-inference workflows for observational tabular data into a small, testable Python library. The initial release is designed around practical treatment-effect estimation rather than theory-heavy experimentation: estimate treatment effects, inspect overlap and balance, and compare estimators with consistent result objects.
 
-The current repository now uses three complementary evidence tracks:
+The current repository now uses four complementary evidence tracks:
 
 - a fixed public-safe observational intervention sample under `data/` for reproducible article figures and tests
 - public benchmark datasets drawn from the causal inference literature for externally recognizable evaluation
 - synthetic known-effect data for correctness-oriented validation of estimator behavior
+- a formal Monte Carlo simulation study evaluating estimator bias, RMSE, coverage, and SE calibration across five data-generating processes
 
 ## What It Demonstrates
 
@@ -51,6 +52,11 @@ The current repository now uses three complementary evidence tracks:
 - Literature comparison table showing CausalLens results match published reference values from Dehejia & Wahba (1999) and Hernán & Robins (2020)
 - Repeated-run stability analysis across seeds, bootstrap counts, and caliper settings
 - External comparison script verifying CausalLens matches manual sklearn/statsmodels implementations to machine precision
+- Difference-in-differences estimator with regression-based ATT, cluster-robust standard errors, and a parallel-trends pre-test
+- Synthetic control method with constrained least-squares donor weights and placebo inference via leave-one-out permutation
+- Two-stage least squares (2SLS) instrumental variables estimator with proper IV variance, first-stage F-statistic, and weak-instrument detection
+- Monte Carlo simulation framework with five DGPs (linear, nonlinear outcome, nonlinear propensity, double nonlinear, strong confounding) evaluating bias, RMSE, coverage, and SE calibration ratio
+- IPW standard errors corrected for propensity-score estimation uncertainty via the Lunceford & Davidian (2004) stacked estimating equations adjustment
 
 ## Current Output
 
@@ -85,11 +91,11 @@ It also writes paper-oriented artifacts under `outputs/charts/` and `outputs/tab
 
 ## Next Upgrade Path
 
-- add panel-data estimators such as difference-in-differences
-- add instrumental variables and 2SLS workflows
-- add article figures, benchmark tables, and formal estimator-comparison writeups
+- add article figures, benchmark tables, and formal estimator-comparison writeups for DiD, synthetic control, and IV
+- add regression discontinuity design (RDD) and bunching estimators
+- expand simulation study to additional sample sizes and publish summary tables
 
-Current artifact generation already supports the first wave of article figures and summary tables, including public benchmark comparisons.
+All cross-sectional estimators, panel-data methods, IV, and simulation infrastructure are now in place.
 
 ## Installation
 
@@ -111,21 +117,37 @@ from causal_lens import (
     RegressionAdjustmentEstimator,
     DoublyRobustEstimator,
     CrossFittedDREstimator,
+    DifferenceInDifferences,
+    TwoStageLeastSquares,
+    run_quick_simulation,
+    summarize_simulation,
 )
 
+# --- Cross-sectional estimators ---
 data = generate_synthetic_observational_data(rows=600, seed=42)
 confounders = ["age", "severity", "baseline_score"]
 
-# Regression adjustment
 reg = RegressionAdjustmentEstimator("treatment", "outcome", confounders)
 result_reg = reg.fit(data)
 
-# Doubly robust with cross-fitting
 dr = CrossFittedDREstimator("treatment", "outcome", confounders)
 result_dr = dr.fit(data)
 
 for r in [result_reg, result_dr]:
     print(f"{r.method:35s}  effect={r.effect:.2f}  SE={r.se:.3f}  p={r.p_value:.4f}")
+
+# --- Panel data: Difference-in-Differences ---
+import pandas as pd
+panel = pd.DataFrame({"unit": [1,1,2,2], "period": [0,1,0,1],
+                      "treat": [1,1,0,0], "y": [3.0,7.0,2.0,4.0]})
+did = DifferenceInDifferences("unit", "period", "treat", "y")
+result_did = did.fit(panel)
+print(f"DiD ATT={result_did.att:.2f}  SE={result_did.se:.3f}")
+
+# --- Monte Carlo simulation study ---
+raw = run_quick_simulation()
+summary = summarize_simulation(raw)
+print(summary[["dgp", "estimator", "bias", "rmse", "coverage"]].to_string(index=False))
 ```
 
 ## Documentation
