@@ -7,6 +7,7 @@ import pandas as pd
 import statsmodels.api as sm
 from scipy.stats import norm
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 
 from causal_lens.data import DataSpec, validate_observational_frame
@@ -36,7 +37,7 @@ class BaseEstimator:
     outcome_col: str
     confounders: list[str]
     estimand: str = "ATE"
-    bootstrap_repeats: int = 40
+    bootstrap_repeats: int = 200
     bootstrap_seed: int = 42
     propensity_trim_bounds: tuple[float, float] | None = None
 
@@ -251,7 +252,7 @@ class PropensityMatcher(BaseEstimator):
         confounders: list[str],
         estimand: str = "ATT",
         caliper: float | None = 0.15,
-        bootstrap_repeats: int = 40,
+        bootstrap_repeats: int = 200,
         bootstrap_seed: int = 42,
         propensity_trim_bounds: tuple[float, float] | None = None,
     ) -> None:
@@ -289,11 +290,24 @@ class PropensityMatcher(BaseEstimator):
     def _estimate_effect(self, frame: pd.DataFrame) -> float:
         propensity = self._fit_propensity(frame)
         matched_pairs = self._matched_pairs(frame, propensity)
-        deltas = [
+        deltas = np.array([
             float(frame.iloc[treated][self.outcome_col] - frame.iloc[control][self.outcome_col])
             for treated, control in matched_pairs
-        ]
-        return float(np.mean(deltas))
+        ])
+        effect = float(np.mean(deltas))
+        # Abadie-Imbens (2006) variance estimator for matched pairs
+        n_pairs = len(deltas)
+        if n_pairs > 1:
+            self._last_se = float(np.sqrt(np.var(deltas, ddof=1) / n_pairs))
+            if self._last_se > 1e-12:
+                z = effect / self._last_se
+                self._last_p_value = float(2.0 * (1.0 - norm.cdf(abs(z))))
+            else:
+                self._last_p_value = None
+        else:
+            self._last_se = None
+            self._last_p_value = None
+        return effect
 
     def _diagnostic_weights(self, frame: pd.DataFrame, propensity: np.ndarray) -> np.ndarray | None:
         matched_pairs = self._matched_pairs(frame, propensity)
@@ -346,7 +360,9 @@ class IPWEstimator(BaseEstimator):
         treated_mean = np.average(outcome[treatment == 1], weights=weights[treatment == 1])
         control_mean = np.average(outcome[treatment == 0], weights=weights[treatment == 0])
         effect = float(treated_mean - control_mean)
-        # Hajek influence-function SE
+        # Hajek influence-function SE (sandwich variance)
+        # Influence values are normalized by sum(w), not mean(w), so the
+        # correct sandwich variance is n * Var(phi) rather than Var(phi)/n.
         n = len(outcome)
         sum_w1 = weights[treatment == 1].sum()
         sum_w0 = weights[treatment == 0].sum()
@@ -407,6 +423,293 @@ class DoublyRobustEstimator(BaseEstimator):
         treatment = frame[self.treatment_col].to_numpy(dtype=int)
         raw = np.where(treatment == 1, 1.0 / propensity, 1.0 / (1.0 - propensity))
         return np.clip(raw, 0.0, self.weight_cap)
+
+
+class CrossFittedDREstimator(BaseEstimator):
+    """Doubly robust estimator with K-fold cross-fitting (DML/AIPW style).
+
+    Avoids overfitting bias by using out-of-fold nuisance estimates.
+    """
+    weight_cap: float = 20.0
+    n_folds: int = 5
+
+    def _estimate_effect(self, frame: pd.DataFrame) -> float:
+        treatment = frame[self.treatment_col].to_numpy(dtype=int)
+        outcome = frame[self.outcome_col].to_numpy(dtype=float)
+        x_raw = frame[self.confounders].to_numpy(dtype=float)
+        n = len(outcome)
+
+        rng = np.random.default_rng(self.bootstrap_seed)
+        fold_ids = np.zeros(n, dtype=int)
+        indices = rng.permutation(n)
+        fold_size = n // self.n_folds
+        for k in range(self.n_folds):
+            start = k * fold_size
+            end = start + fold_size if k < self.n_folds - 1 else n
+            fold_ids[indices[start:end]] = k
+
+        mu1_hat = np.zeros(n)
+        mu0_hat = np.zeros(n)
+        ps_hat = np.zeros(n)
+
+        for k in range(self.n_folds):
+            train_mask = fold_ids != k
+            test_mask = fold_ids == k
+            x_train, x_test = x_raw[train_mask], x_raw[test_mask]
+            t_train = treatment[train_mask]
+            y_train = outcome[train_mask]
+
+            # Propensity model
+            scaler = StandardScaler()
+            x_train_s = scaler.fit_transform(x_train)
+            x_test_s = scaler.transform(x_test)
+            ps_model = LogisticRegression(max_iter=5_000)
+            ps_model.fit(x_train_s, t_train)
+            ps_hat[test_mask] = np.clip(ps_model.predict_proba(x_test_s)[:, 1], 1e-2, 1.0 - 1e-2)
+
+            # Outcome models (separate for treated and control)
+            x_train_t1 = sm.add_constant(x_train[t_train == 1])
+            x_train_t0 = sm.add_constant(x_train[t_train == 0])
+            x_test_c = sm.add_constant(x_test)
+            y_t1 = y_train[t_train == 1]
+            y_t0 = y_train[t_train == 0]
+
+            if len(y_t1) > len(self.confounders) + 1 and len(y_t0) > len(self.confounders) + 1:
+                m1 = sm.OLS(y_t1, x_train_t1).fit()
+                m0 = sm.OLS(y_t0, x_train_t0).fit()
+                mu1_hat[test_mask] = m1.predict(x_test_c)
+                mu0_hat[test_mask] = m0.predict(x_test_c)
+            else:
+                mu1_hat[test_mask] = outcome[test_mask]
+                mu0_hat[test_mask] = outcome[test_mask]
+
+        w1 = np.clip(1.0 / ps_hat, 0.0, self.weight_cap)
+        w0 = np.clip(1.0 / (1.0 - ps_hat), 0.0, self.weight_cap)
+        pseudo = (
+            mu1_hat - mu0_hat
+            + treatment * (outcome - mu1_hat) * w1
+            - (1 - treatment) * (outcome - mu0_hat) * w0
+        )
+        effect = float(np.mean(pseudo))
+        if n > 1:
+            self._last_se = float(np.sqrt(np.var(pseudo, ddof=1) / n))
+            if self._last_se > 1e-12:
+                z = effect / self._last_se
+                self._last_p_value = float(2.0 * (1.0 - norm.cdf(abs(z))))
+            else:
+                self._last_p_value = None
+        else:
+            self._last_se = None
+            self._last_p_value = None
+        return effect
+
+    def _diagnostic_weights(self, frame: pd.DataFrame, propensity: np.ndarray) -> np.ndarray | None:
+        treatment = frame[self.treatment_col].to_numpy(dtype=int)
+        raw = np.where(treatment == 1, 1.0 / propensity, 1.0 / (1.0 - propensity))
+        return np.clip(raw, 0.0, self.weight_cap)
+
+
+class FlexibleDoublyRobustEstimator(BaseEstimator):
+    """Doubly robust estimator using gradient boosting for outcome models.
+
+    Uses GBM for mu1/mu0 to capture nonlinear confounding, with logistic
+    regression for propensity scores and cross-fitting for both.
+    """
+    weight_cap: float = 20.0
+    n_folds: int = 5
+
+    def _estimate_effect(self, frame: pd.DataFrame) -> float:
+        treatment = frame[self.treatment_col].to_numpy(dtype=int)
+        outcome = frame[self.outcome_col].to_numpy(dtype=float)
+        x_raw = frame[self.confounders].to_numpy(dtype=float)
+        n = len(outcome)
+
+        rng = np.random.default_rng(self.bootstrap_seed)
+        fold_ids = np.zeros(n, dtype=int)
+        indices = rng.permutation(n)
+        fold_size = n // self.n_folds
+        for k in range(self.n_folds):
+            start = k * fold_size
+            end = start + fold_size if k < self.n_folds - 1 else n
+            fold_ids[indices[start:end]] = k
+
+        mu1_hat = np.zeros(n)
+        mu0_hat = np.zeros(n)
+        ps_hat = np.zeros(n)
+
+        for k in range(self.n_folds):
+            train_mask = fold_ids != k
+            test_mask = fold_ids == k
+            x_train, x_test = x_raw[train_mask], x_raw[test_mask]
+            t_train = treatment[train_mask]
+            y_train = outcome[train_mask]
+
+            # Propensity model (logistic regression)
+            scaler = StandardScaler()
+            x_train_s = scaler.fit_transform(x_train)
+            x_test_s = scaler.transform(x_test)
+            ps_model = LogisticRegression(max_iter=5_000)
+            ps_model.fit(x_train_s, t_train)
+            ps_hat[test_mask] = np.clip(ps_model.predict_proba(x_test_s)[:, 1], 1e-2, 1.0 - 1e-2)
+
+            # Outcome models (gradient boosting)
+            t1_mask = t_train == 1
+            t0_mask = t_train == 0
+            if t1_mask.sum() > 5 and t0_mask.sum() > 5:
+                gbm1 = GradientBoostingRegressor(
+                    n_estimators=100, max_depth=3, learning_rate=0.1, random_state=self.bootstrap_seed,
+                )
+                gbm0 = GradientBoostingRegressor(
+                    n_estimators=100, max_depth=3, learning_rate=0.1, random_state=self.bootstrap_seed,
+                )
+                gbm1.fit(x_train[t1_mask], y_train[t1_mask])
+                gbm0.fit(x_train[t0_mask], y_train[t0_mask])
+                mu1_hat[test_mask] = gbm1.predict(x_test)
+                mu0_hat[test_mask] = gbm0.predict(x_test)
+            else:
+                mu1_hat[test_mask] = outcome[test_mask]
+                mu0_hat[test_mask] = outcome[test_mask]
+
+        w1 = np.clip(1.0 / ps_hat, 0.0, self.weight_cap)
+        w0 = np.clip(1.0 / (1.0 - ps_hat), 0.0, self.weight_cap)
+        pseudo = (
+            mu1_hat - mu0_hat
+            + treatment * (outcome - mu1_hat) * w1
+            - (1 - treatment) * (outcome - mu0_hat) * w0
+        )
+        effect = float(np.mean(pseudo))
+        if n > 1:
+            self._last_se = float(np.sqrt(np.var(pseudo, ddof=1) / n))
+            if self._last_se > 1e-12:
+                z = effect / self._last_se
+                self._last_p_value = float(2.0 * (1.0 - norm.cdf(abs(z))))
+            else:
+                self._last_p_value = None
+        else:
+            self._last_se = None
+            self._last_p_value = None
+        return effect
+
+    def _diagnostic_weights(self, frame: pd.DataFrame, propensity: np.ndarray) -> np.ndarray | None:
+        treatment = frame[self.treatment_col].to_numpy(dtype=int)
+        raw = np.where(treatment == 1, 1.0 / propensity, 1.0 / (1.0 - propensity))
+        return np.clip(raw, 0.0, self.weight_cap)
+
+
+class TLearner:
+    """T-learner for conditional average treatment effect (CATE) estimation.
+
+    Fits separate outcome models for treated and control groups, then
+    estimates CATE as mu1(x) - mu0(x) for each unit.
+    """
+
+    def __init__(
+        self,
+        treatment_col: str,
+        outcome_col: str,
+        confounders: list[str],
+        *,
+        use_gbm: bool = False,
+        seed: int = 42,
+    ) -> None:
+        self.treatment_col = treatment_col
+        self.outcome_col = outcome_col
+        self.confounders = confounders
+        self.use_gbm = use_gbm
+        self.seed = seed
+
+    def estimate(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Return the original frame with an added 'cate' column."""
+        treatment = frame[self.treatment_col].to_numpy(dtype=int)
+        outcome = frame[self.outcome_col].to_numpy(dtype=float)
+        x = frame[self.confounders].to_numpy(dtype=float)
+
+        t1_mask = treatment == 1
+        t0_mask = treatment == 0
+
+        if self.use_gbm:
+            m1 = GradientBoostingRegressor(
+                n_estimators=100, max_depth=3, learning_rate=0.1, random_state=self.seed,
+            )
+            m0 = GradientBoostingRegressor(
+                n_estimators=100, max_depth=3, learning_rate=0.1, random_state=self.seed,
+            )
+            m1.fit(x[t1_mask], outcome[t1_mask])
+            m0.fit(x[t0_mask], outcome[t0_mask])
+            mu1 = m1.predict(x)
+            mu0 = m0.predict(x)
+        else:
+            x_c = sm.add_constant(x)
+            m1 = sm.OLS(outcome[t1_mask], x_c[t1_mask]).fit()
+            m0 = sm.OLS(outcome[t0_mask], x_c[t0_mask]).fit()
+            mu1 = m1.predict(x_c)
+            mu0 = m0.predict(x_c)
+
+        result = frame.copy()
+        result["cate"] = mu1 - mu0
+        return result
+
+    def ate(self, frame: pd.DataFrame) -> float:
+        """Average treatment effect (mean of CATE estimates)."""
+        result = self.estimate(frame)
+        return float(result["cate"].mean())
+
+
+class SLearner:
+    """S-learner for conditional average treatment effect (CATE) estimation.
+
+    Fits a single outcome model including treatment as a feature, then
+    estimates CATE as mu(x, t=1) - mu(x, t=0).
+    """
+
+    def __init__(
+        self,
+        treatment_col: str,
+        outcome_col: str,
+        confounders: list[str],
+        *,
+        use_gbm: bool = False,
+        seed: int = 42,
+    ) -> None:
+        self.treatment_col = treatment_col
+        self.outcome_col = outcome_col
+        self.confounders = confounders
+        self.use_gbm = use_gbm
+        self.seed = seed
+
+    def estimate(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Return the original frame with an added 'cate' column."""
+        outcome = frame[self.outcome_col].to_numpy(dtype=float)
+        x_base = frame[self.confounders].to_numpy(dtype=float)
+        treatment = frame[self.treatment_col].to_numpy(dtype=float).reshape(-1, 1)
+        x_full = np.hstack([x_base, treatment])
+
+        x1 = np.hstack([x_base, np.ones((len(frame), 1))])
+        x0 = np.hstack([x_base, np.zeros((len(frame), 1))])
+
+        if self.use_gbm:
+            model = GradientBoostingRegressor(
+                n_estimators=100, max_depth=3, learning_rate=0.1, random_state=self.seed,
+            )
+            model.fit(x_full, outcome)
+            mu1 = model.predict(x1)
+            mu0 = model.predict(x0)
+        else:
+            x_full_c = np.column_stack([np.ones(len(frame)), x_full])
+            x1_c = np.column_stack([np.ones(len(frame)), x1])
+            x0_c = np.column_stack([np.ones(len(frame)), x0])
+            model = sm.OLS(outcome, x_full_c).fit()
+            mu1 = model.predict(x1_c)
+            mu0 = model.predict(x0_c)
+
+        result = frame.copy()
+        result["cate"] = mu1 - mu0
+        return result
+
+    def ate(self, frame: pd.DataFrame) -> float:
+        """Average treatment effect (mean of CATE estimates)."""
+        result = self.estimate(frame)
+        return float(result["cate"].mean())
 
 
 def run_placebo_test(

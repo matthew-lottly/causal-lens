@@ -86,8 +86,8 @@ def _run_estimators(
 
 def run_stability_analysis() -> pd.DataFrame:
     return run_stability_analysis_with_settings(
-        seeds=[42, 123, 7, 2024, 999],
-        bootstrap_counts=[20, 40, 80],
+        seeds=[42, 123, 7, 2024, 999, 314, 55, 808, 1776, 2025, 31415, 65536],
+        bootstrap_counts=[50, 200, 500],
         calipers={"lalonde": [0.03, 0.05, 0.10], "nhefs": [0.01, 0.02, 0.05]},
     )
 
@@ -141,8 +141,8 @@ def export_stability_artifacts(output_dir: Path, *, quick: bool = False) -> tupl
     tables_dir.mkdir(parents=True, exist_ok=True)
     if quick:
         raw = run_stability_analysis_with_settings(
-            seeds=[42, 123],
-            bootstrap_counts=[20],
+            seeds=[42, 123, 7, 2024, 999],
+            bootstrap_counts=[50],
             calipers={"lalonde": [0.05], "nhefs": [0.02]},
         )
     else:

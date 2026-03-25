@@ -79,6 +79,7 @@ def compare_on_dataset(
     frame: pd.DataFrame,
     confounders: list[str],
     outcome_col: str,
+    propensity_trim_bounds: tuple[float, float] | None = None,
 ) -> list[dict]:
     rows: list[dict] = []
     for method_name, cls, manual_fn in [
@@ -86,8 +87,19 @@ def compare_on_dataset(
         ("IPW", IPWEstimator, _manual_ipw_stabilized),
         ("DoublyRobust", DoublyRobustEstimator, _manual_dr),
     ]:
-        cl_result = cls("treatment", outcome_col, confounders, bootstrap_repeats=10).fit(frame)
-        manual_result = manual_fn(frame, confounders, outcome_col)
+        cl_result = cls(
+            "treatment", outcome_col, confounders,
+            bootstrap_repeats=10,
+            propensity_trim_bounds=propensity_trim_bounds,
+        ).fit(frame)
+        # Apply same trim to manual comparison
+        eval_frame = frame
+        if propensity_trim_bounds is not None:
+            p = _manual_propensity(frame, confounders)
+            lo, hi = propensity_trim_bounds
+            mask = (p >= lo) & (p <= hi)
+            eval_frame = frame.loc[mask].reset_index(drop=True)
+        manual_result = manual_fn(eval_frame, confounders, outcome_col)
         rows.append({
             "dataset": name,
             "method": method_name,
@@ -104,7 +116,11 @@ def build_external_comparison() -> pd.DataFrame:
     nhefs = load_nhefs_complete_benchmark()
 
     all_rows: list[dict] = []
-    all_rows.extend(compare_on_dataset("lalonde", lalonde, LALONDE_CONFOUNDERS, "outcome"))
+    # Use the same trim bounds as the CLI for Lalonde weighting estimators
+    all_rows.extend(compare_on_dataset(
+        "lalonde", lalonde, LALONDE_CONFOUNDERS, "outcome",
+        propensity_trim_bounds=(0.03, 0.97),
+    ))
     all_rows.extend(compare_on_dataset("nhefs", nhefs, NHEFS_COMPLETE_CONFOUNDERS, "outcome"))
     return pd.DataFrame(all_rows)
 

@@ -5,10 +5,14 @@ import math
 import pandas as pd
 
 from causal_lens.estimators import (
+    CrossFittedDREstimator,
     DoublyRobustEstimator,
+    FlexibleDoublyRobustEstimator,
     IPWEstimator,
     PropensityMatcher,
     RegressionAdjustmentEstimator,
+    SLearner,
+    TLearner,
     run_placebo_test,
 )
 from causal_lens.synthetic import generate_synthetic_observational_data
@@ -185,3 +189,102 @@ def test_se_consistent_with_bootstrap_ci() -> None:
     analytic_width = 2 * 1.96 * result.se
     ratio = analytic_width / bootstrap_width
     assert 0.3 < ratio < 3.0  # within a factor of 3
+
+
+def test_ipw_se_consistent_with_bootstrap_ci() -> None:
+    """IPW sandwich SE should be broadly consistent with bootstrap CI width."""
+    confounders, dataset = _dataset()
+    result = IPWEstimator("treatment", "outcome", confounders, bootstrap_repeats=40).fit(dataset)
+    assert result.se is not None
+    assert result.ci_low is not None and result.ci_high is not None
+    bootstrap_width = result.ci_high - result.ci_low
+    analytic_width = 2 * 1.96 * result.se
+    ratio = analytic_width / bootstrap_width
+    assert 0.3 < ratio < 5.0  # IPW sandwich SE can be conservative
+
+
+def test_matching_reports_abadie_imbens_se() -> None:
+    confounders, dataset = _dataset()
+    result = PropensityMatcher("treatment", "outcome", confounders, bootstrap_repeats=20).fit(dataset)
+    assert result.se is not None
+    assert result.se > 0.0
+    assert result.p_value is not None
+    assert 0.0 <= result.p_value <= 1.0
+
+
+def test_cross_fitted_dr_recovers_positive_effect() -> None:
+    confounders, dataset = _dataset()
+    result = CrossFittedDREstimator("treatment", "outcome", confounders, bootstrap_repeats=20).fit(dataset)
+    assert result.effect > 1.0
+    assert result.effect < 4.0
+    assert result.se is not None
+    assert result.se > 0.0
+    assert result.p_value is not None
+
+
+def test_cross_fitted_dr_se_is_valid() -> None:
+    confounders, dataset = _dataset()
+    result = CrossFittedDREstimator("treatment", "outcome", confounders, bootstrap_repeats=20).fit(dataset)
+    assert result.se is not None
+    assert result.ci_low is not None and result.ci_high is not None
+    bootstrap_width = result.ci_high - result.ci_low
+    analytic_width = 2 * 1.96 * result.se
+    ratio = analytic_width / bootstrap_width
+    assert 0.2 < ratio < 5.0
+
+
+def test_flexible_dr_recovers_positive_effect() -> None:
+    confounders, dataset = _dataset()
+    result = FlexibleDoublyRobustEstimator("treatment", "outcome", confounders, bootstrap_repeats=20).fit(dataset)
+    assert result.effect > 1.0
+    assert result.effect < 4.0
+    assert result.se is not None
+    assert result.p_value is not None
+
+
+def test_t_learner_recovers_positive_ate() -> None:
+    confounders, dataset = _dataset()
+    learner = TLearner("treatment", "outcome", confounders)
+    ate = learner.ate(dataset)
+    assert ate > 1.0
+    assert ate < 4.0
+
+
+def test_t_learner_cate_column_present() -> None:
+    confounders, dataset = _dataset()
+    learner = TLearner("treatment", "outcome", confounders)
+    result = learner.estimate(dataset)
+    assert "cate" in result.columns
+    assert len(result) == len(dataset)
+
+
+def test_t_learner_gbm_recovers_positive_ate() -> None:
+    confounders, dataset = _dataset()
+    learner = TLearner("treatment", "outcome", confounders, use_gbm=True)
+    ate = learner.ate(dataset)
+    assert ate > 0.5
+    assert ate < 5.0
+
+
+def test_s_learner_recovers_positive_ate() -> None:
+    confounders, dataset = _dataset()
+    learner = SLearner("treatment", "outcome", confounders)
+    ate = learner.ate(dataset)
+    assert ate > 1.0
+    assert ate < 4.0
+
+
+def test_s_learner_cate_column_present() -> None:
+    confounders, dataset = _dataset()
+    learner = SLearner("treatment", "outcome", confounders)
+    result = learner.estimate(dataset)
+    assert "cate" in result.columns
+    assert len(result) == len(dataset)
+
+
+def test_s_learner_gbm_recovers_positive_ate() -> None:
+    confounders, dataset = _dataset()
+    learner = SLearner("treatment", "outcome", confounders, use_gbm=True)
+    ate = learner.ate(dataset)
+    assert ate > 0.5
+    assert ate < 5.0
