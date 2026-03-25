@@ -109,6 +109,12 @@ Or in development mode:
 pip install -e .
 ```
 
+For review or replication work:
+
+```bash
+pip install -e .[dev]
+```
+
 ## Quick Start
 
 ```python
@@ -150,6 +156,30 @@ summary = summarize_simulation(raw)
 print(summary[["dgp", "estimator", "bias", "rmse", "coverage"]].to_string(index=False))
 ```
 
+## Reproducibility
+
+Run the test suite:
+
+```bash
+pytest
+```
+
+Regenerate the default report and paper-oriented artifacts:
+
+```bash
+causal-lens
+```
+
+This writes the JSON report plus tracked charts and tables under `outputs/charts/` and `outputs/tables/`.
+
+## Submission-Facing Assets
+
+- `README.md` provides installation, scope, and reviewer-facing reproduction commands.
+- `CITATION.cff` provides machine-readable citation metadata.
+- `LICENSE` provides the repository license.
+- `docs/methodology.md`, `docs/reference-validation.md`, and `docs/limitations-and-assumptions.md` provide manuscript-supporting narrative.
+- `outputs/charts/` and `outputs/tables/` contain the tracked benchmark artifacts used in the current evidence stack.
+
 ## Documentation
 
 See [docs/architecture.md](docs/architecture.md) for the design notes.
@@ -158,3 +188,7 @@ See [docs/public-benchmarks.md](docs/public-benchmarks.md) for the public datase
 See [docs/benchmark-interpretation.md](docs/benchmark-interpretation.md) for a results-oriented reading of the current benchmark artifacts.
 See [docs/reference-validation.md](docs/reference-validation.md) for executable validation logic tied to the future journal article.
 See [docs/limitations-and-assumptions.md](docs/limitations-and-assumptions.md) for a paper-ready limitations section.
+
+## Citation
+
+Citation metadata is available in `CITATION.cff`.
